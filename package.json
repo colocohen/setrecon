@@ -1,0 +1,67 @@
+{
+  "name": "setrecon",
+  "version": "0.1.0",
+  "description": "Set reconciliation between two peers over any transport - IBLT, Strata, buckets, and BCH sketch, picked automatically.",
+  "main": "setrecon.js",
+  "module": "setrecon.mjs",
+  "types": "setrecon.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./setrecon.d.mts",
+        "default": "./setrecon.mjs"
+      },
+      "require": {
+        "types": "./setrecon.d.ts",
+        "default": "./setrecon.js"
+      },
+      "default": "./setrecon.js"
+    }
+  },
+  "files": [
+    "setrecon.js",
+    "setrecon.mjs",
+    "setrecon.d.ts",
+    "setrecon.d.mts",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "keywords": [
+    "set-reconciliation",
+    "reconciliation",
+    "sync",
+    "iblt",
+    "invertible-bloom",
+    "bloom-filter",
+    "strata-estimator",
+    "bch",
+    "pinsketch",
+    "minisketch",
+    "peer-to-peer",
+    "p2p",
+    "webrtc",
+    "mempool",
+    "gossip",
+    "crdt"
+  ],
+  "author": "colocohen",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/colocohen/setrecon.git"
+  },
+  "bugs": {
+    "url": "https://github.com/colocohen/setrecon/issues"
+  },
+  "homepage": "https://github.com/colocohen/setrecon#readme",
+  "funding": [
+    {
+      "type": "github",
+      "url": "https://github.com/sponsors/colocohen"
+    }
+  ],
+  "engines": {
+    "node": ">=12.20.0"
+  }
+}
