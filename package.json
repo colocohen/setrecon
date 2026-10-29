@@ -1,6 +1,6 @@
 {
   "name": "setrecon",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Set reconciliation between two peers over any transport - IBLT, Strata, buckets, and BCH sketch, picked automatically.",
   "main": "setrecon.js",
   "module": "setrecon.mjs",

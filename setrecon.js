@@ -88,22 +88,25 @@
 
 var DEFAULT_TIMEOUT = 30000;   // ms — overall sync deadline
 
-// After the service asks the application for something and doesn't hear
-// back, this fires. Two cases:
-//   1. Initiator lazy mode: caller registered with count+fingerprint only;
-//      decider then needed items → emitted 'provide_items_needed' → waiting.
-//   2. Responder side: peer sent HELLO for a syncId we have no state for
-//      → emitted 'requested' → waiting for application to emit 'set'.
-// Runs INSIDE the overall timeout; whichever fires first wins.
-var APP_RESPONSE_TIMEOUT = 10000;
-
-// If the local app is still working after this quiet grace period, we send
-// a HOLD to the peer telling them to give us more time. A fast-path
-// application (answers within HOLD_GRACE) never triggers a HOLD — no
-// extra wire message. Slow-loading apps hold the peer politely.
-var HOLD_GRACE = 2000;                 // ms — start sending HOLDs after this
-var HOLD_EXTRA_TIME = 10000;           // ms — each HOLD asks for this much extra
-var HOLD_MAX_TOTAL = 60000;
+/*
+ * WAITING ON A SLOW APPLICATION.
+ *
+ * When the list is loaded lazily, the application may take a long time to
+ * answer a 'need'. There is no separate application-response timeout: the
+ * ONE deadline above governs, and a slow load is covered by extending it.
+ *
+ * After HOLD_GRACE of silence this side starts sending 'hold', which asks
+ * the far side to extend its own deadline by HOLD_EXTRA_MS. Extensions are
+ * bounded by HOLD_MAX_TOTAL in both directions, so an application that never
+ * answers - and a peer that holds forever - still fail rather than hang.
+ *
+ * (An APP_RESPONSE_TIMEOUT constant used to be declared here and described
+ * at length, but nothing ever read it. The bound that actually applies is
+ * HOLD_MAX_TOTAL, so the dead constant is gone and this says what happens.)
+ */
+var HOLD_GRACE     = 2000;     // ms — start sending holds after this
+var HOLD_EXTRA_MS  = 10000;    // ms — each hold asks for this much extra
+var HOLD_MAX_TOTAL = 60000;    // ms — ceiling on total extension, per side
 
 /*
  * How many items a peer asks for at a time.
@@ -118,7 +121,7 @@ var HOLD_MAX_TOTAL = 60000;
  * fatter encoding means a proportionally bigger message, and a caller with a
  * transport limit lowers this themselves.
  */
-var DEFAULT_CHUNK = 4000;            // ms — ceiling on total extension (safety)
+var DEFAULT_CHUNK = 4000;            // items — not ms; see the note above
 
 // IBLT: cells = max(24, 2·d + 16), k = 4 for d≤200, k = 3 for d>200
 var IBLT_HEDGE       = 2.0;
@@ -141,13 +144,15 @@ var STRATA_MAX_LEVELS  = 25;
 // full-dump savings exceed 4× it.
 var STRATA_BUDGET_FRACTION = 0.25;
 
-// Seeds — must match on both sides. SEED_ROOT is the fingerprint seed.
-var SEED_ROOT      = 1n;                     // HELLO fingerprint (app-visible)
-var SEED_IBLT_IX   = 0x1B17C0DEn;            // IBLT cell-index stream
-var SEED_IBLT_FP   = 0xF1A6E2D3C4B5A697n;    // IBLT cell fingerprint (hashSum)
-var SEED_STRATA    = 5n;                     // Strata partition seed
-// BUCKETS partition uses plain splitmix64(item) — no separate seed needed
-// because it's not combined with any other hash use of the same item.
+/*
+ * Seeds live with the 32-bit hash, as S32_* below — they must match on both
+ * sides, and there is exactly one set of them.
+ *
+ * A parallel set of BigInt seeds (SEED_ROOT, SEED_IBLT_IX, SEED_IBLT_FP,
+ * SEED_STRATA) used to be declared here, left over from when hashing went
+ * through splitmix64. Nothing read them once hash32 took over, and keeping
+ * two sets of seeds where one is live is how a seed mismatch gets shipped.
+ */
 
 
 // =========================================================================
@@ -238,9 +243,20 @@ var S32_IBLT_FP = [0xC4B5A697, 0xF1A6E2D3];
 var S32_STRATA = [0x00000005, 0x00000000];
 var S32_BUCKET = [0x9E3779B9, 0x00000000];
 
-// Item hash keyed by a per-purpose seed. Seed is BigInt; item is Number.
-// Returns BigInt in [0, 2^64).
-// Callers that need a Number wrap this with & MASK53 and Number().
+/*
+ * The splitmix64 item hash, keyed by a BigInt seed. Returns a BigInt in
+ * [0, 2^64).
+ *
+ * NOTHING INSIDE THE LIBRARY USES THIS ANY MORE. Every live hash - the
+ * fingerprint, the IBLT indices, the strata levels, the bucket assignment -
+ * goes through hash32, which is 9.6x faster. This is kept only because it was
+ * exported and something may still call it, and because gf64's reference
+ * implementation is checked against the same BigInt arithmetic.
+ *
+ * It is NOT interchangeable with hashItem53: they are different functions
+ * over different seeds and do not agree. To keep a fingerprint current, use
+ * hashItem53, which is the one computeFingerprint is built from.
+ */
 function hashItem64(item, seedBig) {
     return splitmix64(BigInt(item) ^ seedBig);
 }
@@ -287,6 +303,67 @@ function computeFingerprint(items) {
 }
 
 /*
+ * WHAT COUNTS AS AN ITEM, checked once on the way in.
+ *
+ * An item is split into a 32-bit low half and a 21-bit high half wherever it
+ * is stored in a cell - see cellItem - and rebuilt from those halves when it
+ * comes back off the wire. Both halves are taken with `>>> 0`, which discards
+ * a fractional part and wraps anything at or above 2^53.
+ *
+ * So an item outside the contract does not fail: it comes back CHANGED. A
+ * sync of two 20,000-item lists differing by {1.5, 2.5} reported the
+ * difference as {1, 2}, with reason 'complete' and the right count - a wrong
+ * answer wearing a success. FULL_DUMP and BUCKETS hid it, because both ship
+ * items verbatim and never rebuild one from halves; it only appears once the
+ * lists are large enough for the IBLT to be chosen, which is exactly when a
+ * caller has stopped watching.
+ *
+ * The ceiling is 2^53 - 1 rather than 2^53, because 2^53 is the first value
+ * whose high half needs a 22nd bit and is silently masked to zero.
+ *
+ * This is a bare numeric loop - no allocation, no hashing - so it costs a few
+ * milliseconds on a million items. The duplicate check is NOT folded in here:
+ * it needs a hash table the size of the input, and a caller supplying their
+ * own fingerprint is deliberately skipping that scan. Pass `validate: false`
+ * to skip this one too, once your ids are known to be in range.
+ */
+var MAX_ITEM = 9007199254740991;        /* 2^53 - 1 */
+
+/*
+ * Zero cannot be carried by the BCH sketch - every power of it is zero, so
+ * it contributes nothing to any syndrome and the item simply vanishes.
+ * Returns the offending index, or -1.
+ */
+function findZero(items) {
+    for (var i = 0; i < items.length; i++) { if (items[i] === 0) { return i; } }
+    return -1;
+}
+
+function rejectZero(items) {
+    if (findZero(items) !== -1) {
+        throw new Error('setrecon: zero is not a valid item when the sketch ' +
+                        'is enabled - the sketch cannot carry it. Offset your ' +
+                        'ids by one, or drop `sketch`.');
+    }
+    return items;
+}
+
+function validateItems(items) {
+    for (var i = 0; i < items.length; i++) {
+        var v = items[i];
+        if (typeof v !== 'number' || !isFinite(v) ||
+            Math.floor(v) !== v || v < 0 || v > MAX_ITEM) {
+            throw new Error('setrecon: item at index ' + i + ' is ' +
+                            (typeof v === 'number' ? v : typeof v) +
+                            ' - items must be integers from 0 to 2^53-1. ' +
+                            'Hash strings and UUIDs into that range first; ' +
+                            'anything else is silently altered in transit.');
+        }
+    }
+    return items;
+}
+
+/*
  * Pack two 32-bit words into the 53 bits a JavaScript number holds exactly:
  * all of the low word, and 21 bits of the high one. XOR commutes with the
  * mask, so a fingerprint stays updatable in place.
@@ -295,9 +372,21 @@ function fp53(lo, hi) {
     return (lo >>> 0) + ((hi & 0x1fffff) >>> 0) * 4294967296;
 }
 
-/** The per-item contribution, for callers keeping a fingerprint current. */
+/**
+ * The per-item contribution, for callers keeping a fingerprint current.
+ *
+ * The seed is a [lo, hi] pair. A seed of the wrong SHAPE used to be accepted
+ * silently - seed[0] and seed[1] came back undefined, hash32 coerced them to
+ * zero, and the result was a plausible-looking number that did not match the
+ * fingerprint. Since the only thing a caller does with this value is XOR it
+ * into a fingerprint, a wrong one is undetectable downstream, so it throws.
+ */
 function hashItem53(item, seed) {
     var s = seed || S32_ROOT;
+    if (!s.length || typeof s[0] !== 'number' || typeof s[1] !== 'number') {
+        throw new Error('setrecon: seed must be a [lo, hi] pair of numbers, ' +
+                        'e.g. setrecon.core.SEED_ROOT');
+    }
     var h = hash32(item, s[0], s[1]);
     return fp53(h[0], h[1]);
 }
@@ -618,13 +707,6 @@ function trailingZeros32(item) {
     return 64;
 }
 
-function trailingZeros64(v) {
-    if (v === 0n) return 64;
-    var tz = 0;
-    while ((v & 1n) === 0n) { v >>= 1n; tz++; }
-    return tz;
-}
-
 function strataLevelsFor(nA, nB) {
     // d can never exceed nA + nB, so ⌊log2(nA+nB)⌋+1 strata always suffice.
     var dmax = Math.max(2, nA + nB);
@@ -800,7 +882,6 @@ function buildBuckets(items, B) {
 
 var BYTES_ITEM         = 8;
 var BYTES_HASH         = 8;
-var BYTES_COUNT        = 4;
 var BYTES_IBLT_CELL    = 20;
 var BYTES_STRATA_CELL  = 20;
 var BYTES_MSG_OVERHEAD = 10;
@@ -916,6 +997,13 @@ var ROUND_TRIPS = { FULL_DUMP: 1, BUCKETS: 2, STRATA: 2, SKETCH: 1 };
  * With neither figure supplied this returns the byte count unchanged, which
  * keeps the old behaviour exactly.
  *
+ * AN RTT WITHOUT A BANDWIDTH IS NOT A LINK MODEL. The formula needs the
+ * bandwidth to turn bytes into time; without one the bytes term was zero, so
+ * the score was round trips alone and the dump - one crossing - won at every
+ * size: fifteen megabytes for two lists of a million that Strata settles in
+ * forty kilobytes. So an rtt is used only with a bandwidth, and bytes decide
+ * otherwise. A bandwidth alone is kept: it ranks exactly as bytes do.
+ *
  * IT OPTIMISES TIME, AND THAT IS NOT ALWAYS WHAT YOU WANT. Across 81
  * combinations of size, difference, latency and bandwidth it was faster in 45
  * and slower in one - and that one traded fifteen milliseconds for ten times
@@ -923,8 +1011,10 @@ var ROUND_TRIPS = { FULL_DUMP: 1, BUCKETS: 2, STRATA: 2, SKETCH: 1 };
  * peers, that is the wrong trade. Supplying a link model says latency is the
  * scarce thing; leaving it out says bytes are.
  */
+function hasLinkModel(link) { return !!(link && link.bandwidth > 0); }
+
 function costOf(algo, bytes, link) {
-    if (!link || (!link.rtt && !link.bandwidth)) { return bytes; }
+    if (!hasLinkModel(link)) { return bytes; }
     var trips = ROUND_TRIPS[algo] || 2;
     var rtt = link.rtt || 0;
     var bw = link.bandwidth || 0;
@@ -935,7 +1025,8 @@ function costOf(algo, bytes, link) {
 
 /**
  * @param {object} [link]  { rtt, bandwidth } - measured, not guessed. rtt in
- *        milliseconds, bandwidth in Mbps. Either may be omitted.
+ *        milliseconds, bandwidth in Mbps. rtt counts only with a bandwidth
+ *        (see costOf); a bandwidth alone ranks as bytes do.
  */
 function decidePreStrata(nA, nB, expectedDiff, allowSketch, link) {
     var maxN = Math.max(nA, nB);
@@ -1006,7 +1097,7 @@ function decidePreStrata(nA, nB, expectedDiff, allowSketch, link) {
      * budget rule entirely - a dump that looks extravagant in bytes is often
      * the fastest thing on a quick link, because it crosses once.
      */
-    if (link && (link.rtt || link.bandwidth)) {
+    if (hasLinkModel(link)) {
         var opts = [
             { algo: 'FULL_DUMP', bytes: predictFullDumpBytes(nA, nB), params: {} },
             { algo: 'BUCKETS', bytes: predictBucketsBytes(nA, nB, Math.sqrt(maxN)),
@@ -1088,27 +1179,14 @@ function decidePostStrata(nA, nB, dHat, dRaw) {
 
 
 /* ---------------- defaults ---------------- */
-
-var DEFAULT_TIMEOUT = 30000;
-var APP_RESPONSE_TIMEOUT = 10000;    /* how long to wait for provide() */
-var HOLD_GRACE = 2000;               /* start sending 'hold' after this */
-var HOLD_EXTRA_MS = 10000;           /* how much each hold asks for */
-var HOLD_MAX_TOTAL = 60000;
-
 /*
- * How many items a peer asks for at a time.
+ * DEFAULT_TIMEOUT, HOLD_GRACE, HOLD_EXTRA_MS, HOLD_MAX_TOTAL and
+ * DEFAULT_CHUNK are declared once, at the top of the file.
  *
- * FOUR THOUSAND, which is about 32 KB of identifiers - the same size as the
- * largest message the library already sends and cannot split, the Strata
- * estimate at 30 KB. Splitting below that would only mean more round trips
- * for a message that was never the biggest thing on the wire.
- *
- * Counted in items rather than bytes, because this library does not
- * serialise and has no idea what a caller's encoder makes of a number. A
- * fatter encoding means a proportionally bigger message, and a caller with a
- * transport limit lowers this themselves.
+ * They used to be declared a second time here, with the same values. `var`
+ * makes that silent, and two declarations of a tuning constant is a standing
+ * invitation to change one of them.
  */
-var DEFAULT_CHUNK = 4000;
 
 /*
  * A sketch's syndromes are pairs of 32-bit halves. They cross the wire as a
@@ -1130,6 +1208,49 @@ function unflattenSketch(flat) {
         out[i] = [flat[i * 2] >>> 0, flat[i * 2 + 1] >>> 0];
     }
     return out;
+}
+
+/* ---------------- agreeing on the decision inputs ---------------- */
+
+function present(v) { return typeof v === 'number' && isFinite(v); }
+
+/*
+ * The link both sides decide on, from what each measured. Either side's
+ * figure is used when only one gave it; when both did, the slower reading:
+ * the higher rtt and the lower bandwidth, which is the link the exchange will
+ * actually get in its worse direction. An rtt with no bandwidth anywhere is no
+ * link model at all (see costOf).
+ */
+function mergeLink(rtt1, bw1, rtt2, bw2) {
+    var bw = present(bw1) && bw1 > 0 ? bw1 : undefined;
+    if (present(bw2) && bw2 > 0) { bw = (bw === undefined) ? bw2 : Math.min(bw, bw2); }
+    if (bw === undefined) { return null; }
+    var rtt = present(rtt1) && rtt1 > 0 ? rtt1 : 0;
+    if (present(rtt2) && rtt2 > rtt) { rtt = rtt2; }
+    return { rtt: rtt, bandwidth: bw };
+}
+
+/**
+ * Combine the two sides' decision inputs. Symmetric in its two halves - swap
+ * them and the answer is the same - which is what lets both sides compute it
+ * independently and agree without another message.
+ *
+ *   expectedDiff  either side's; both → the higher. A hint that is too low
+ *                 sizes a sketch or an IBLT that fails to decode and costs a
+ *                 fallback; one that is too high costs a few bytes.
+ *   sketch        both sides must allow it: decoding it costs real CPU (about
+ *                 a second at the cap), and one side cannot spend it for the
+ *                 other.
+ *   link          see mergeLink.
+ */
+function mergeInputs(hint1, sketch1, rtt1, bw1, hint2, sketch2, rtt2, bw2) {
+    var h = present(hint1) ? hint1 : undefined;
+    if (present(hint2)) { h = (h === undefined) ? hint2 : Math.max(h, hint2); }
+    return {
+        expectedDiff: h,
+        sketch: !!(sketch1 && sketch2),
+        link: mergeLink(rtt1, bw1, rtt2, bw2)
+    };
 }
 
 /* ---------------- a minimal emitter ---------------- */
@@ -1170,7 +1291,18 @@ Emitter.prototype._fire = function (name, a, b, c, d) {
  *   sketch       {boolean}        allow the BCH sketch when expectedDiff is small
  *   overhead     {number}         multiplier if your encoder is fatter
  *   timeout      {number}         overall deadline, ms
+ *   validate     {boolean}        false skips the item range check; only do
+ *                                 this once the ids are known to be integers
+ *                                 in [0, 2^53-1], because out-of-range items
+ *                                 come back CHANGED rather than rejected
  *   setTimeout / clearTimeout     for a simulation with virtual time
+ *   now          {function}       clock to match them, for the same
+ *
+ * ON ITEMS: integers from 0 to 2^53-1, and unique. Out of that range they are
+ * rebuilt wrongly from their 32/21-bit halves, which is why `validate` is on
+ * by default. Zero is fine everywhere EXCEPT the sketch, which cannot carry
+ * it; enabling `sketch` with a zero in the list throws here rather than
+ * further in.
  *
  * ON expectedDiff: it is worth giving ONLY when it comes from measurement -
  * time since the last successful sync times the observed rate of new items. A
@@ -1186,8 +1318,28 @@ function setrecon(opts) {
     var o = opts || {};
     var s = new Emitter();
 
+    var checkItems = (o.validate !== false);
+
     var items = o.items || null;
     var count = items ? items.length : (o.count || 0);
+
+    if (items && checkItems) {
+        validateItems(items);
+        /*
+         * Zero is rejected here, not deeper in, BECAUSE THE SKETCH THROWS ON
+         * IT. That throw used to surface from inside feed() - out of the
+         * message handler and into the caller's transport callback, where
+         * nothing expects an exception - and it left both sides waiting out
+         * their timeouts. Throwing from the constructor puts the error in the
+         * caller's own stack frame, where a bad configuration belongs.
+         *
+         * Only when the sketch is asked for: zero is a perfectly good item on
+         * every other path, and rejecting it outright would break callers
+         * whose ids start at zero and who never enable the sketch.
+         */
+        if (o.sketch) { rejectZero(items); }
+    }
+
     var fingerprint = o.fingerprint;
     if (fingerprint === undefined && items) {
         fingerprint = computeFingerprint(items);
@@ -1213,6 +1365,14 @@ function setrecon(opts) {
     var overhead = o.overhead || 1;
     var setT = o.setTimeout || setTimeout;
     var clearT = o.clearTimeout || clearTimeout;
+    /*
+     * Extending a deadline means knowing how much of it is left, which needs
+     * a clock as well as a timer. A simulation running on virtual time
+     * already supplies setTimeout/clearTimeout and should supply `now` with
+     * them; without it the extension arithmetic would read a wall clock that
+     * its timers are not on.
+     */
+    var nowFn = o.now || Date.now;
 
     /* session state */
     var role = null;              /* 'initiator' | 'responder' */
@@ -1234,15 +1394,20 @@ function setrecon(opts) {
     var sketchCap = 0;
 
     /*
-     * The decision inputs, agreed through the hello.
+     * The decision inputs: this side's, as its hello will carry them, and the
+     * ones agreed with the peer once its hello is in (see mergeInputs).
      *
-     * The link belongs to whichever side drives, for the same reason the hint
-     * does: both sides must reach the same answer, and only one of them
-     * measured the connection.
+     * expectedDiff and rtt are whole numbers on the wire for any sane encoder,
+     * so they are rounded here, before they are compared with the peer's copy
+     * of them: the two sides must compute from identical values, and a 100.4
+     * here that arrives as 100 there is two different inputs.
      */
-    var effectiveHint = o.expectedDiff;
+    var myHint = present(o.expectedDiff) ? Math.max(0, Math.round(o.expectedDiff)) : undefined;
+    var myRtt  = (present(o.rtt) && o.rtt > 0) ? Math.round(o.rtt) : undefined;
+    var myBw   = (present(o.bandwidth) && o.bandwidth > 0) ? o.bandwidth : undefined;
+    var effectiveHint = myHint;
     var allowSketch = !!o.sketch;
-    var link = (o.rtt || o.bandwidth) ? { rtt: o.rtt, bandwidth: o.bandwidth } : null;
+    var link = mergeLink(myRtt, myBw, undefined, undefined);
 
     /*
      * PULL MODE: only one side needs the answer.
@@ -1261,6 +1426,20 @@ function setrecon(opts) {
      */
     var pulling = !!o.pull;
     var peerPulling = false;
+    /*
+     * Set when THIS side lost the two-puller tie-break above.
+     *
+     * The losing side answers normally and learns nothing, so it finishes
+     * 'complete' with two empty lists - which is byte for byte what a session
+     * between two identical peers reports. A caller who asked to pull cannot
+     * tell "there was nothing to fetch" from "my request was overruled and I
+     * fetched nothing", and those call for opposite next moves.
+     *
+     * It is reported in the finish stats rather than as a different reason,
+     * because the sync did complete and existing reason-handling should not
+     * have to change to keep working.
+     */
+    var pullOverridden = false;
 
     /*
      * ASKING BEATS SENDING BLIND.
@@ -1307,6 +1486,8 @@ function setrecon(opts) {
 
     /* timers */
     var deadline = null;
+    var deadlineAt = 0;          /* when the deadline lands, on nowFn's clock */
+    var grantedTotal = 0;        /* extension handed out so far, both causes */
     var holdTimer = null;
     var holdTotal = 0;
 
@@ -1329,8 +1510,12 @@ function setrecon(opts) {
     var outbox = [];
     var inHandler = 0;
 
+    /* the far side knows this session is over: it ended it, or we said so */
+    var told = false;
+
     function send(type, data, predicted) {
         if (finished) { return; }
+        if (type === 'abort' || type === 'reject') { told = true; }
         messages++;
         bytes += Math.round((predicted || 0) * overhead);
         outbox.push([type, data]);
@@ -1364,13 +1549,32 @@ function setrecon(opts) {
      */
     function finish(reason, myMissing, peerMissing) {
         if (finished) { return; }
+        /*
+         * AN ENDING THE FAR SIDE CANNOT SEE IS SENT TO IT.
+         *
+         * Most endings are shared: both sides finish on the same message, or
+         * one side aborts or rejects and says so. The rest happen here only -
+         * our deadline passed, the caller never provided its items, a message
+         * from the peer was malformed - and the far side, hearing nothing,
+         * waited out its whole deadline, a minute and more with holds, for a
+         * reply that was never coming. It looked like a dead peer. So the
+         * reason goes out as an abort, once, before the session closes.
+         *
+         * Not before the session began: a peer that never heard from us has
+         * nothing to end.
+         */
+        if (!told && role && reason !== 'complete' && reason !== 'limit') {
+            send('abort', { reason: reason }, 12);
+        }
         finished = true;
         clearTimers();
         s._fire('finish', reason, myMissing || [], peerMissing || [], {
             algorithm: algo,
             messages: messages,
             predictedBytes: bytes,
-            role: role
+            role: role,
+            /* true only when this side asked to pull and was overruled */
+            pullOverridden: pullOverridden
         });
     }
 
@@ -1433,6 +1637,17 @@ function setrecon(opts) {
 
         s._provide = function (got) {
             if (items || finished) { return; }
+            /*
+             * The lazy path gets the same check as the eager one. A list
+             * arriving from a database is MORE likely to carry a surprise -
+             * a float from a numeric column, a bigint driver returning a
+             * string - not less, and by this point the caller's stack is
+             * gone, so an exception here would land in a timer.
+             */
+            if (checkItems) {
+                try { validateItems(got); }
+                catch (e) { fail('bad_items'); s._fire('error', e); return; }
+            }
             items = got;
             count = got.length;
             if (holdTimer) { clearT(holdTimer); holdTimer = null; }
@@ -1444,9 +1659,45 @@ function setrecon(opts) {
         s._fire('need', hint);
     }
 
-    function bumpDeadline(extra) {
+    /*
+     * Arm the one overall deadline, `ms` from now.
+     *
+     * deadlineAt is tracked alongside the timer because a timer handle does
+     * not say how much of it is left, and an extension has to know.
+     */
+    function armDeadline(ms) {
         if (deadline) { clearT(deadline); }
-        deadline = setT(function () { fail('timeout'); }, extra);
+        deadlineAt = nowFn() + ms;
+        deadline = setT(function () { fail('timeout'); }, ms);
+    }
+
+    /**
+     * Extend the deadline. THIS ADDS TO WHAT IS LEFT; it never shortens it.
+     *
+     * It used to REPLACE the deadline with `extra` milliseconds, which
+     * inverted the meaning of the one message whose entire job is to buy
+     * time: a session with a 30 second budget that received a hold two
+     * seconds in came out with twelve seconds instead of twenty-eight, and a
+     * hold asking for anything under the remaining budget actively shortened
+     * it. Measured on the original: `timeout: 30000` plus a hold of 1200ms
+     * died after 1202ms.
+     *
+     * `extra` ARRIVES FROM THE NETWORK, so it is not trusted. A peer sending
+     * extraMs: 5 used to close the session in six milliseconds, and a
+     * negative value closed it on the next tick; both now fall back to the
+     * default. Grants are capped in total so a peer cannot hold a session
+     * open indefinitely by repeating them.
+     */
+    function bumpDeadline(extra) {
+        var e = (typeof extra === 'number' && isFinite(extra) && extra > 0)
+              ? extra : HOLD_EXTRA_MS;
+
+        if (grantedTotal >= HOLD_MAX_TOTAL) { return; }
+        e = Math.min(e, HOLD_MAX_TOTAL - grantedTotal);
+        grantedTotal += e;
+
+        var remaining = Math.max(0, deadlineAt - nowFn());
+        armDeadline(remaining + e);
     }
 
     /* ---------------- the algorithms ---------------- */
@@ -1553,11 +1804,31 @@ function setrecon(opts) {
      * Both sides decoding would double the CPU for no extra information -
      * and decoding is the expensive half here by a wide margin.
      */
+    /*
+     * A ZERO CAN STILL REACH THE SKETCH.
+     *
+     * Both sides must allow the sketch, and a side that allows it has its
+     * zeros rejected in the constructor - but only when it validates: with
+     * `validate: false`, or with items that arrived later through provide(),
+     * a zero gets this far, and building the sketch throws.
+     *
+     * So both sketch sites check first and end the session cleanly, with a
+     * reason that names the cause, rather than throwing out of a message
+     * handler and leaving the far side to time out.
+     */
+    function sketchBlockedByZero(all) {
+        if (findZero(all) === -1) { return false; }
+        send('abort', { reason: 'zero_item' }, 12);
+        fail('zero_item');
+        return true;
+    }
+
     function runSketch(capacity) {
         algo = 'SKETCH';
         sketchCap = capacity;
         if (!drives()) { return; }
         needItems({ all: true }, function (all) {
+            if (sketchBlockedByZero(all)) { return; }
             var sk = sketch(capacity);
             for (var i = 0; i < all.length; i++) { sk.add(all[i]); }
             send('sketch', { capacity: capacity, syndromes: flattenSketch(sk.raw()) },
@@ -1659,12 +1930,12 @@ function setrecon(opts) {
         if (role || finished) { return s; }
         role = 'initiator';
         phase = 'hello';
-        deadline = setT(function () { fail('timeout'); }, o.timeout || DEFAULT_TIMEOUT);
+        armDeadline(o.timeout || DEFAULT_TIMEOUT);
         withFingerprint(function () {
             send('hello', {
                 count: count, fingerprint: fingerprint,
-                expectedDiff: o.expectedDiff, sketch: !!o.sketch,
-                rtt: o.rtt, bandwidth: o.bandwidth, pull: !!o.pull,
+                expectedDiff: myHint, sketch: !!o.sketch,
+                rtt: myRtt, bandwidth: myBw, pull: !!o.pull,
                 chunkSize: chunkSize
             }, 24);
         });
@@ -1721,7 +1992,7 @@ function setrecon(opts) {
             bumpDeadline(data.extraMs || HOLD_EXTRA_MS);
             return;
         }
-        if (type === 'abort') { fail(data && data.reason || 'aborted'); return; }
+        if (type === 'abort') { told = true; fail(data && data.reason || 'aborted'); return; }
 
         /*
          * `done` MEANS "I HAVE NO MORE REQUESTS", NOT "STOP".
@@ -1741,12 +2012,12 @@ function setrecon(opts) {
             if (iAmDone) { endSession(); }
             return;
         }
-        if (type === 'reject') { fail('rejected'); return; }
+        if (type === 'reject') { told = true; fail('rejected'); return; }
 
         /* first contact: we are the responder */
         if (!role) {
             role = 'responder';
-            deadline = setT(function () { fail('timeout'); }, o.timeout || DEFAULT_TIMEOUT);
+            armDeadline(o.timeout || DEFAULT_TIMEOUT);
         }
 
         /*
@@ -1800,39 +2071,36 @@ function setrecon(opts) {
              * failure: the sync completes.
              */
             if (pulling && peerPulling) {
-                if (fingerprint > data.fingerprint) { pulling = false; }
+                if (fingerprint > data.fingerprint) { pulling = false; pullOverridden = true; }
                 else { peerPulling = false; }
             }
 
             /*
-             * THE HINT TRAVELS IN THE HELLO, and both sides use the
-             * INITIATOR'S.
+             * THE INPUTS TRAVEL IN THE HELLO, AND BOTH SIDES COMBINE THEM THE
+             * SAME WAY.
              *
              * The decider is only leaderless because it is a pure function of
-             * values both sides hold - and expectedDiff is not one of those unless it
-             * crosses. Without this the two sides really did diverge: the
-             * initiator picked the sketch while the responder picked buckets,
-             * and each answered a protocol the other was not running. Ordered
-             * delivery hid it, because the initiator finished on whichever
-             * reply arrived and the mismatch never surfaced.
+             * values both sides hold - and expectedDiff, the sketch flag and
+             * the link are not among them unless they cross. Without that the
+             * two sides really did diverge: one picked the sketch while the
+             * other picked buckets, and each answered a protocol the other was
+             * not running.
              *
-             * Taking the initiator's rather than combining them keeps the rule
-             * one line and leaves no case where the two arithmetics differ.
+             * They used to be taken whole from the side with the lower
+             * fingerprint, which is an agreement but throws information away:
+             * a hint given on one side was used only when that side happened
+             * to have the lower fingerprint - and twelve times in twenty it did
+             * not, so a sync the sketch settles in 330 bytes took 24 KB. Now
+             * whatever either side gave is used, and what both gave is
+             * combined by rules that read the same from either end (see
+             * mergeInputs). Equal fingerprints no longer diverge either: under
+             * the old rule each side took the other's.
              */
-            /*
-             * The hint comes from whichever side drives, so both compute the
-             * same decision. Keying it on role would diverge the moment both
-             * sides called start().
-             */
-            if (fingerprint < data.fingerprint) {
-                effectiveHint = o.expectedDiff;
-                allowSketch = !!o.sketch;
-            } else {
-                effectiveHint = data.expectedDiff;
-                allowSketch = !!data.sketch;
-                link = (data.rtt || data.bandwidth)
-                     ? { rtt: data.rtt, bandwidth: data.bandwidth } : null;
-            }
+            var merged = mergeInputs(myHint, !!o.sketch, myRtt, myBw,
+                                     data.expectedDiff, !!data.sketch, data.rtt, data.bandwidth);
+            effectiveHint = merged.expectedDiff;
+            allowSketch = merged.sketch;
+            link = merged.link;
 
             /*
              * The responder always answers, INCLUDING when the fingerprints
@@ -1843,8 +2111,8 @@ function setrecon(opts) {
             if (role === 'responder' && !needsFingerprint) {
                 send('hello', {
                     count: count, fingerprint: fingerprint,
-                    expectedDiff: o.expectedDiff, sketch: !!o.sketch,
-                rtt: o.rtt, bandwidth: o.bandwidth, pull: !!o.pull,
+                    expectedDiff: myHint, sketch: !!o.sketch,
+                rtt: myRtt, bandwidth: myBw, pull: !!o.pull,
                 chunkSize: chunkSize
                 }, 24);
             }
@@ -1855,8 +2123,8 @@ function setrecon(opts) {
                 withFingerprint(function () {
                     send('hello', {
                         count: count, fingerprint: fingerprint,
-                        expectedDiff: o.expectedDiff, sketch: !!o.sketch,
-                rtt: o.rtt, bandwidth: o.bandwidth, pull: !!o.pull,
+                        expectedDiff: myHint, sketch: !!o.sketch,
+                rtt: myRtt, bandwidth: myBw, pull: !!o.pull,
                 chunkSize: chunkSize
                     }, 24);
                     if (fingerprint === d0.fingerprint && count === d0.count) {
@@ -2158,6 +2426,7 @@ function setrecon(opts) {
             }
             algo = 'SKETCH';
             needItems({ all: true }, function (all) {
+                if (sketchBlockedByZero(all)) { return; }
                 var mine = sketch(data.capacity);
                 for (var i = 0; i < all.length; i++) { mine.add(all[i]); }
                 mine.merge(unflattenSketch(data.syndromes));
@@ -2766,7 +3035,21 @@ setrecon.core = {
     /* exported so a caller can keep a fingerprint current without
        recomputing it - add and remove are the same call */
     xor53: xor53,
-    SEED_ROOT: SEED_ROOT,
+    /*
+     * THE SEED hashItem53 AND computeFingerprint ACTUALLY USE, as the
+     * [lo, hi] pair hash32 takes.
+     *
+     * This used to export a BigInt `1n` left over from the splitmix64 era,
+     * while hashItem53 expected the pair. Passing the exported seed into the
+     * exported function therefore read seed[0] and seed[1] off a BigInt, got
+     * undefined for both, and returned a DIFFERENT hash from the one the
+     * fingerprint is built out of - silently. A caller following the
+     * documented "keep your fingerprint current" recipe corrupted it.
+     *
+     * Calling hashItem53(item) with no seed was always correct and still is;
+     * this only makes the explicit form agree with it.
+     */
+    SEED_ROOT: S32_ROOT,
 
     ibltNew: ibltNew,
     ibltInsert: ibltInsert,

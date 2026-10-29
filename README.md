@@ -199,8 +199,12 @@ net.on('message', (peerId, type, bytes) => {
     if (!sessions[peerId]) {
         const s = setrecon({ items: myIds });
         s.on('send', (t, d) => net.send(peerId, t, encode(d)));
-        s.on('finish', mine => { mine.forEach(fetchItem); delete sessions[peerId]; });
-        ```
+        s.on('finish', (reason, mine) => { mine.forEach(fetchItem); delete sessions[peerId]; });
+        sessions[peerId] = s;
+    }
+    sessions[peerId].feed(type, decode(bytes));
+});
+```
 
 The receiving side never calls `start()` — the first message opens the session.
 
@@ -336,6 +340,11 @@ times the bytes.
 link, or one shared with eight other peers, leave them out and let it minimise
 bytes.
 
+**`rtt` needs `bandwidth`.** Time is round trips times `rtt` plus bytes over
+`bandwidth`; without a bandwidth there is no way to put a price on bytes, and a
+latency alone would make the one-crossing dump look best at any size. So `rtt`
+on its own is ignored and bytes decide. `bandwidth` on its own is fine.
+
 ### `count` and `fingerprint` — when the list is expensive to read
 
 Give a count instead of items and the list is fetched on demand, once, and
@@ -450,8 +459,10 @@ they agree without another message.
 
 ### `sketch` — fewest bytes, most CPU
 
-Off by default. When on, and when `expectedDiff` says the difference is small, a BCH
-sketch carries the whole difference in a few hundred bytes.
+Off by default, and **both sides must turn it on** — decoding costs CPU on
+both ends, and one side cannot spend the other's. When both allow it, and
+`expectedDiff` (from either side) says the difference is small, a BCH sketch
+carries the whole difference in a few hundred bytes.
 
 ```
 20,000 items, 20 differ:
@@ -485,6 +496,13 @@ Fires exactly once, however the session ends.
 Results are always present. On a clean finish they're the answer; on a
 timeout they're empty; and there is no third case where you have to guess
 which.
+
+Both sides finish, whichever one the ending came from. When a session ends for
+a reason only this side can see — its deadline passed, `provide()` never came,
+the peer sent something malformed — it sends that reason to the far side as an
+`abort` before closing, so the far side finishes at once with the same reason
+instead of waiting out its own deadline. Pass the abort's `reason` through your
+encoder and it arrives intact.
 
 ```js
 s.on('need', hint => {})
@@ -537,15 +555,24 @@ You don't pick one. The decider does, from the facts you supplied.
 
 Both sides run the same decision function over the same inputs, so no message
 announces the choice — the type of the next message reveals it. The inputs
-that only one side holds (`expectedDiff`, `rtt`, `bandwidth`) travel in the handshake
-so both sides compute the same answer.
+that only one side holds (`expectedDiff`, `sketch`, `rtt`, `bandwidth`) travel in
+the handshake, and both sides combine the two sets by the same rules:
+
+| input | one side gave it | both gave it |
+|---|---|---|
+| `expectedDiff` | that one | the higher — too low fails a decode, too high costs a few bytes |
+| `sketch` | off | on only if **both** allow it — the decode costs CPU on both ends |
+| `rtt` | that one (needs a `bandwidth` somewhere) | the higher |
+| `bandwidth` | that one | the lower |
+
+So a hint given on either side is used, whichever side starts.
 
 ---
 
 ## 🔄 A sync is a snapshot
 
 A session is single-use. It reads your list once, answers for what it read, and
-ends — `done` or `fail` fires and that session is finished. The next sync starts
+ends — `finish` fires and that session is finished. The next sync starts
 from wherever things are then.
 
 **Items that change mid-sync are fine.** Every path works from the list it
@@ -601,6 +628,15 @@ simply pushes the next one later instead of stacking on top of it. And because
 `finish` fires however the session ended, there is no path that skips the
 rescheduling.
 
+**Tag each message with its session when sessions follow one another.** The
+loop above opens a new session for every round, and nothing in a message says
+which round it belongs to. On a transport that can hold a message back — a
+retry, a relay, a queue — a message from the round that just ended can arrive
+after the next one started, and gets fed into it. A number per round, carried
+with every message and checked before `feed()`, keeps them apart: drop a
+message whose round is not the one running. Like the peer, which round a
+message belongs to is your bookkeeping; the library cannot tell.
+
 If you want changes to trigger a sync sooner, let them shorten the gap rather
 than start a session:
 
@@ -647,7 +683,7 @@ function onDelete(id) { fp = xor53(fp, hashItem53(id)); }
   correctness.
 - One session per peer at a time. Starting a second while the first is running
   gives you two answers for one question — which is why the loop above chains
-  off `done` instead of running on a timer.
+  off `finish` instead of running on a timer.
 
 ## 🧩 Recipes (what you can build)
 
@@ -715,8 +751,8 @@ wss.on('connection', ws => {
   which is fine, it just does not help.
 - The puller still learns **both** directions. It receives the other side's
   contents and compares locally; what it skips is *sending* its own.
-- One session per connection. A session is single-use: once `done` or `fail`
-  fires, build a new one for the next sync.
+- One session per connection. A session is single-use: once `finish` fires,
+  build a new one for the next sync.
 
 ### Detecting deletions
 
@@ -837,6 +873,7 @@ Measured on 5,000 items with 20 differing:
 
 💡 **Tips**
 
+- Both sides set `sketch: true`; the hint can come from either.
 - The sketch trades bandwidth for CPU, and the trade only pays below a
   difference of about 20 — above that the decider ignores it. On a shared link
   with many peers it is the right trade; on a fast private link it is not.
@@ -927,7 +964,10 @@ without moving the byte count.
 
 **Items are numbers up to 2^53, and must be unique.** The fingerprint is an
 XOR, so a repeated item cancels itself: `[1,2,3,3]` and `[1,2,5,5]` would look
-identical. This is checked, and a duplicate throws.
+identical. This is NOT checked — finding a duplicate needs a hash table the size
+of the list, on every session — so uniqueness is yours to keep. The range is
+checked (pass `validate: false` to skip that too, once your ids are known to be
+in range).
 
 **Zero is not a valid item** when the sketch is enabled — its powers are all
 zero, so it can't be carried. Offset your IDs by one.
